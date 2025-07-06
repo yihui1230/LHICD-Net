@@ -1,0 +1,291 @@
+import torch
+from torch import nn, softmax
+from pytorch_wavelets import DWTForward
+from resnet import resnet18
+from einops import rearrange
+from help_funcs_CTD import TwoLayerConv2d, TransformerDecoder, Cross_Attention,  PreNorm2, \
+    Residual, PreNorm, FeedForward
+from dct import slide_dct
+"""Modified according to by https://github.com/RSMagneto/CTD-Former"""
+
+class Down_wt(nn.Module):
+    def __init__(self,in_channel,out_channel):
+        super(Down_wt, self).__init__()
+        self.wt = DWTForward(J=1, mode='zero', wave='haar')
+        self.conv_bn_relu = nn.Sequential(
+            nn.Conv2d(in_channel * 3, out_channel, kernel_size=1, stride=1),
+            nn.BatchNorm2d(out_channel),
+            nn.ReLU(inplace=True),
+        )
+    def forward(self, x):
+        yL, yH = self.wt(x)
+        y_HL = yH[0][:,:,0,::]
+        y_LH = yH[0][:,:,1,::]
+        y_HH = yH[0][:,:,2,::]
+        x = torch.cat([ y_HL, y_LH, y_HH], dim=1)
+        x = self.conv_bn_relu(x)
+        return x
+class ConvBNReLU(nn.Sequential):
+    def __init__(self, in_planes, out_planes, kernel_size=3, stride=1, groups=1, dilation=1):
+        padding = (kernel_size - 1) // 2
+        if dilation != 1:
+            padding = dilation
+        super(ConvBNReLU, self).__init__(
+            nn.Conv2d(in_planes, out_planes, kernel_size, stride, padding, groups=groups, dilation=dilation),
+            nn.BatchNorm2d(out_planes),
+            nn.ReLU(inplace=True)
+        )
+
+class CrossTransformer(nn.Module):
+    def __init__(self,channel,ker_s,stride,inner_dim=512, depth=1, heads=8, dim_head=64, mlp_dim=64, dropout=0):
+
+        super(CrossTransformer, self).__init__()
+        dim=channel*ker_s*ker_s
+        self.ker_s=ker_s
+        self.channel=channel
+        self.stride=stride
+        self.layers = nn.ModuleList([])
+        for _ in range(depth):
+            self.layers.append(nn.ModuleList([
+                PreNorm2(dim,Cross_Attention(dim, heads=heads,
+                                                        dim_head=dim_head, dropout=dropout,
+                                                        softmax=softmax)),
+                Residual(PreNorm(dim, FeedForward(dim, mlp_dim, dropout=dropout)))
+            ]))
+        self.bn=nn.BatchNorm2d(dim)
+        self.conv_3 = ConvBNReLU(channel, dim, stride=stride)
+        self.dw_conv7=nn.Conv2d(dim,dim,7,1,3,groups=dim)
+
+
+    def forward(self, x1, x2, mask=None):
+        output1 = self.bn(slide_dct(x1, self.ker_s, self.stride))
+        output1=self.dw_conv7(output1)
+
+        x1 = self.conv_3(x1)
+        x1 = x1.flatten(2).transpose(-1, -2)
+
+        output2 = self.bn(slide_dct(x2, self.ker_s, self.stride))
+        output2=self.dw_conv7(output2)
+
+
+        output1 = output1.flatten(2).transpose(-1, -2)
+        output2 = output2.flatten(2).transpose(-1, -2)
+        for attn, ff in self.layers:
+            x1 = attn(output1,output2, mask=mask)+x1
+            x1 = ff(x1)
+        return x1
+
+class EXModel(nn.Module):
+    def __init__(self, input_nc=3, output_nc=32,
+                 resnet_stages_num=4, backbone='resnet18',
+                 output_sigmoid=False, if_upsample_2x=True):
+
+        super(EXModel,self).__init__()
+        expand = 1
+        if backbone == 'resnet18':
+            self.resnet = resnet18(pretrained=True
+                                          )
+        self.relu = nn.ReLU()
+        self.upsamplex2 = nn.Upsample(scale_factor=2)
+        self.upsamplex4 = nn.Upsample(scale_factor=4, mode='bilinear')
+        self.upsamplex8 = nn.Upsample(scale_factor=8, mode='bilinear')
+        self.classifier = TwoLayerConv2d(in_channels=256, out_channels=output_nc)
+        self.resnet_stages_num = resnet_stages_num
+        self.if_upsample_2x = if_upsample_2x
+        if self.resnet_stages_num == 4:
+            layers = 256 * expand
+        elif self.resnet_stages_num == 3:
+            layers = 128 * expand
+        else:
+            raise NotImplementedError
+        self.conv_pred = nn.Conv2d(layers, out_channels=output_nc, kernel_size=3, padding=1)
+
+        self.output_sigmoid = output_sigmoid
+        self.sigmoid = nn.Sigmoid()
+        self.dwt_down_1=Down_wt(3,64)
+
+        self.dwt_down_3 = Down_wt(64, 128)
+    def forward(self, x):
+        x = self.resnet.conv1(x)+self.dwt_down_1(x)
+        x = self.resnet.bn1(x)
+        x = self.resnet.relu(x)
+        x_4 = self.resnet.layer1(x)
+        x_8 = self.resnet.layer2(x_4)+self.dwt_down_3(x_4)
+        if self.resnet_stages_num > 3:
+            x_8 = self.resnet.layer3(x_8)
+        if self.resnet_stages_num == 5:
+            x_8 = self.resnet.layer4(x_8)
+        elif self.resnet_stages_num > 5:
+            raise NotImplementedError
+        if self.if_upsample_2x:
+            x = self.upsamplex2(x_8)
+        else:
+            x = x_8
+        x = self.conv_pred(x)
+        return x,x_4
+
+    def forward(self, x):
+        x = self.downsample(x)
+        return x
+class CrossModel(nn.Module):
+    def __init__(self,channel,ker_s,stride):
+        super(CrossModel,self).__init__()
+        self.transformer = nn.ModuleList(
+            [CrossTransformer(channel=channel,ker_s=ker_s,stride=stride, depth=1, heads=8, dim_head=64, mlp_dim=64, dropout=0) for i in range(1)])
+        self.linear=nn.Linear(channel*ker_s*ker_s,channel)
+    def forward(self,x1,x2):
+        for l in self.transformer:
+            output= l(x1, x2)
+        output=self.linear(output)
+        return output
+class DEModel(nn.Module):
+    def __init__(self, dim,decoder_softmax=True, with_decoder_pos=None):
+        super(DEModel, self).__init__()
+        decoder_pos_size = 256 // 4
+        self.with_decoder_pos = with_decoder_pos
+        if self.with_decoder_pos == 'learned':
+            self.pos_embedding_decoder = nn.Parameter(torch.randn(1, 32,
+                                                                  decoder_pos_size,
+                                                                  decoder_pos_size))
+        self.transformer_decoder=TransformerDecoder(dim=dim, depth=1, heads=8, dim_head=64, mlp_dim=32, dropout=0,
+                                                      softmax=decoder_softmax)
+    def forward(self,x1,x2):
+        b, c, h, w = x1.shape
+        if self.with_decoder_pos == 'fix':
+            x1 = x1 + self.pos_embedding_decoder
+        elif self.with_decoder_pos == 'learned':
+            x1 = x1 + self.pos_embedding_decoder
+        x1 = rearrange(x1, 'b c h w -> b (h w) c')
+        x = self.transformer_decoder(x1, x2)
+        x = rearrange(x, 'b (h w) c -> b c h w', h=h)
+
+        return x
+
+class ChannelAttention(nn.Module):
+    def __init__(self, in_channels, ratio = 8):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc1 = nn.Conv2d(in_channels,in_channels//ratio,1,bias=False)
+        self.relu1 = nn.ReLU()
+        self.fc2 = nn.Conv2d(in_channels//ratio, in_channels,1,bias=False)
+        self.sigmod = nn.Sigmoid()
+    def forward(self,x):
+        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
+        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
+        out = avg_out + max_out
+        return self.sigmod(out)
+
+class TemporalFeatureFusionModule(nn.Module):
+    def __init__(self, in_d, out_d):
+        super(TemporalFeatureFusionModule, self).__init__()
+        self.in_d = in_d
+        self.out_d = out_d
+        self.relu = nn.ReLU(inplace=True)
+
+        self.conv_branch1 = ConvBNReLU(self.in_d, self.out_d, kernel_size=3, stride=1, dilation=7)
+
+        self.conv3_branch1 = ConvBNReLU(self.in_d,self.out_d)
+        self.conv1_branch1 = nn.Conv2d(self.out_d * 2, self.out_d, kernel_size=1)
+
+        self.conv_branch2 = ConvBNReLU(self.out_d, self.out_d, kernel_size=3, stride=1,  dilation=5)
+        self.conv3_branch2 = ConvBNReLU(self.out_d, self.out_d)
+        self.conv1_branch2 = nn.Conv2d(self.out_d * 2, self.out_d, kernel_size=1)
+
+        self.conv_branch3 = ConvBNReLU(self.out_d, self.out_d, kernel_size=3, stride=1,  dilation=3)
+        self.conv3_branch3 = ConvBNReLU(self.out_d, self.out_d)
+        self.conv1_branch3 = nn.Conv2d(self.out_d * 2, self.out_d, kernel_size=1)
+
+        self.conv_branch4 = ConvBNReLU(self.out_d, self.out_d, kernel_size=3, stride=1, dilation=1)
+        self.conv3_branch4 = ConvBNReLU(self.out_d, self.out_d)
+        self.conv1_branch4 = nn.Conv2d(self.out_d * 2, self.out_d, kernel_size=1)
+
+
+        self.conv_branch5 = nn.Conv2d(self.in_d, self.out_d, kernel_size=1)
+
+
+    def forward(self, x):
+
+        x_branch1 = self.conv1_branch1(torch.cat([self.conv_branch1(x),self.conv3_branch1(x)],1))
+
+        x_branch2 = self.conv1_branch2(torch.cat([self.conv_branch2(x_branch1), self.conv3_branch2(x_branch1)], 1))
+
+        x_branch3 = self.conv1_branch3(torch.cat([self.conv_branch3(x_branch2), self.conv3_branch3(x_branch2)], 1))
+
+        x_branch4 = self.conv1_branch4(torch.cat([self.conv_branch4(x_branch3), self.conv3_branch4(x_branch3)], 1))
+
+
+        x_out = self.relu(self.conv_branch5(x) + x_branch4)
+
+        return x_out
+
+class refine_branch(nn.Module):
+    def __init__(self,dim=32):
+        super().__init__()
+        self.channel_atten_x=ChannelAttention(dim)
+        self.channel_atten_c = ChannelAttention(dim)
+        self.conv_x=ConvBNReLU(dim,dim)
+        self.conv_c=ConvBNReLU(dim,dim)
+        self.pcm_1=TemporalFeatureFusionModule(dim,dim*2)
+        self.pcm_2 = TemporalFeatureFusionModule(dim*2,dim*2)
+
+        self.conv_3 = ConvBNReLU(dim*4, dim*5//2)
+        self.sigmoid=nn.Sigmoid()
+
+    def forward(self, x,c):
+        x = self.conv_x(x * self.channel_atten_x(x))
+        c = self.conv_c(c * self.channel_atten_c(c))
+
+        f1=self.pcm_2(self.pcm_1(x))
+
+        x = torch.cat([x, c, f1], 1)
+        x = self.conv_3(x)
+
+        return x
+
+class Model(nn.Module):
+    def __init__(self,output_sigmoid=False,output_nc=1):
+        super(Model,self).__init__()
+        proj_channel=32
+        self.CrossModel = CrossModel(proj_channel,3, 2)
+        self.DEModel =DEModel(dim=proj_channel)
+        self.classifier = TwoLayerConv2d(in_channels=160, out_channels=output_nc)
+        self.upsamplex4 = nn.Upsample(scale_factor=4, mode='bilinear')
+        self.output_sigmoid = output_sigmoid
+        self.sigmoid = nn.Sigmoid()
+        self.conv=nn.Conv2d(proj_channel,proj_channel,3,1,1)
+        self.EXModel = EXModel(if_upsample_2x=False)
+        self.fuse = refine_branch(proj_channel)
+
+
+
+    def forward(self, x1=None,x2=None):
+          x1,xA2=self.EXModel(x1)
+          E1 = self.conv(x1)
+          x2,xB2 = self.EXModel(x2)
+          E2 = self.conv(x2)
+
+          c1 = self.CrossModel(x1,x2)
+          c2 = self.CrossModel(x2,x1)
+          DE1 = self.DEModel(E1,c1)
+          DE2 = self.DEModel(E2, c2)
+
+          output1 = self.fuse(E1,  DE1)
+
+          output2 = self.fuse(E2, DE2)
+
+
+          output = torch.cat((output1,output2), dim=1)
+
+
+          output = self.upsamplex4(output)
+
+          output = self.classifier(output)
+          if self.output_sigmoid:
+             output = self.sigmoid(output)
+
+          return output
+
+
+
+
