@@ -1,4 +1,4 @@
-import torch
+import torc
 from torch import nn, softmax
 from pytorch_wavelets import DWTForward
 from resnet import resnet18
