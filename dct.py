@@ -1,4 +1,4 @@
-import torch.nn.functional as F
+import torch.nn.functional as 
 import torch_dct as dct
 import torch.nn as nn
 
