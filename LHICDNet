@@ -3,7 +3,7 @@ from torch import nn, softmax
 from pytorch_wavelets import DWTForward
 from resnet import resnet18
 from einops import rearrange
-from help_funcs_CTD import TwoLayerConv2d, TransformerDecoder, Cross_Attention,  PreNorm2, \
+from help_funcs import TwoLayerConv2d, TransformerDecoder, Cross_Attention,  PreNorm2, \
     Residual, PreNorm, FeedForward
 from dct import slide_dct
 """Modified according to by https://github.com/RSMagneto/CTD-Former"""
